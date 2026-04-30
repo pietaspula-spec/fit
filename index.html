@@ -510,6 +510,22 @@ function todayKey() { return new Date().toISOString().split('T')[0]; }
 function formatDate(k) { return new Date(k+'T12:00:00').toLocaleDateString('hr-HR',{weekday:'long',day:'numeric',month:'long',year:'numeric'}); }
 function allExercises() { return [...DEFAULT_EXERCISES, ...state.customExercises]; }
 function getEx(id) { return allExercises().find(e => e.id === id); }
+function cleanNum(v, min=0, max=999) {
+  const n = parseFloat(v);
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(Math.max(n, min), max);
+}
+function calcVolume(exId, sets) {
+  const ex = getEx(exId);
+  if (ex?.cardio) return 0;
+  return sets.reduce((a,s)=>a+cleanNum(s.reps)*cleanNum(s.weight),0);
+}
+function formatSetChip(exId, s, i) {
+  const ex = getEx(exId);
+  return ex?.cardio
+    ? `${i+1}: ${cleanNum(s.reps)} min · razina ${cleanNum(s.weight,0,10)}`
+    : `${i+1}: ${cleanNum(s.reps)}×${cleanNum(s.weight)}kg`;
+}
 function toast(msg) {
   const t = document.getElementById('toast');
   t.textContent = msg; t.classList.add('show');
@@ -521,15 +537,23 @@ function toast(msg) {
 // ═══════════════════════════════════════
 function calcKcal(exId, sets) {
   const ex = getEx(exId); if (!ex) return 0;
-  const w  = state.profile.weight || 80;
+  const profileWeight = cleanNum(state.profile.weight, 0, 250);
+  const w  = profileWeight > 0 ? Math.max(profileWeight, 30) : 80;
   if (ex.cardio) {
-    const totalMin = sets.reduce((a,s) => a + (parseFloat(s.reps)||0), 0);
-    return Math.round((ex.met||5.5) * w * (totalMin/60));
+    const total = sets.reduce((a,s) => {
+      const min = cleanNum(s.reps);
+      const level = cleanNum(s.weight, 0, 10);
+      const levelFactor = level > 0 ? 0.7 + level * 0.1 : 1;
+      return a + (ex.met||5.5) * levelFactor * w * (min/60);
+    }, 0);
+    return Math.round(total);
   }
-  // Snaga: aproksimacija trajanja (4s/rep + 60s odmor/serija)
-  const totalReps = sets.reduce((a,s) => a + (parseFloat(s.reps)||0), 0);
-  const durationH = (totalReps*4 + sets.length*60) / 3600;
-  return Math.round((ex.met||3.5) * w * durationH);
+  // Snaga: aktivno dizanje i odmor imaju odvojene MET vrijednosti.
+  const totalReps = sets.reduce((a,s) => a + cleanNum(s.reps), 0);
+  const activeH = (totalReps*4) / 3600;
+  const restSeconds = cleanNum(state.settings?.restTimerDuration ?? 60, 30, 180);
+  const restH = (Math.max(sets.length-1, 0) * restSeconds) / 3600;
+  return Math.round(((ex.met||3.5) * w * activeH) + (1.5 * w * restH));
 }
 
 function calcTodayKcal() {
@@ -665,6 +689,8 @@ function getPrevSets(exId) {
 
 // Epley 1RM formula
 function calc1RM(weight, reps) {
+  weight = cleanNum(weight);
+  reps = cleanNum(reps);
   if (!weight || !reps || reps < 1) return 0;
   if (reps === 1) return weight;
   return Math.round(weight * (1 + reps / 30));
@@ -675,8 +701,8 @@ function updateORM(inputEl) {
   const row  = inputEl.closest('.set-row');
   const inps = row.querySelectorAll('input');
   if (!inps[0] || !inps[1]) return;
-  const reps   = parseFloat(inps[0].value) || 0;
-  const weight = parseFloat(inps[1].value) || 0;
+  const reps   = cleanNum(inps[0].value);
+  const weight = cleanNum(inps[1].value);
   const ormEl  = row.querySelector('.orm-live');
   if (!ormEl) return;
   const orm = calc1RM(weight, reps);
@@ -708,8 +734,8 @@ function addSetRow(i, reps, weight) {
   }
 
   // Initial 1RM
-  const initOrm = (!isC && reps > 1) ? calc1RM(parseFloat(weight)||0, parseFloat(reps)||0) : 0;
-  const ormDisplay = (initOrm > (parseFloat(weight)||0) && (parseFloat(reps)||0) > 1)
+  const initOrm = (!isC && reps > 1) ? calc1RM(cleanNum(weight), cleanNum(reps)) : 0;
+  const ormDisplay = (initOrm > cleanNum(weight) && cleanNum(reps) > 1)
     ? `<span class="orm-badge">1RM ≈ <strong>${initOrm}</strong> kg</span>`
     : '';
 
@@ -720,7 +746,7 @@ function addSetRow(i, reps, weight) {
       ${prevHint ? `<div class="set-prev">${prevHint}</div>` : ''}
     </div>
     <div>
-      <input type="number" min="0" max="999" step="0.5" placeholder="${isC?'nivel':'kg'}" value="${weight}" inputmode="decimal" oninput="updateORM(this)"/>
+      <input type="number" min="0" max="${isC?'10':'999'}" step="${isC?'1':'0.5'}" placeholder="${isC?'nivel':'kg'}" value="${weight}" inputmode="decimal" oninput="updateORM(this)"/>
     </div>
     <button class="del-set" onclick="this.closest('.set-row').remove();renumberSets()">✕</button>
     <div class="orm-live" style="grid-column:2/4;display:${ormDisplay?'block':'none'}">${ormDisplay}</div>`;
@@ -737,7 +763,13 @@ function saveExercise() {
   const rows = document.querySelectorAll('#setsContainer .set-row');
   if (!rows.length) { toast('Dodaj barem jednu seriju!'); return; }
   const sets = [];
-  rows.forEach(r => { const inp=r.querySelectorAll('input'); sets.push({reps:parseFloat(inp[0].value)||0, weight:parseFloat(inp[1].value)||0}); });
+  rows.forEach(r => {
+    const inp = r.querySelectorAll('input');
+    const reps = cleanNum(inp[0].value);
+    const weight = selectedEx.cardio ? cleanNum(inp[1].value, 0, 10) : cleanNum(inp[1].value);
+    if (reps > 0 || weight > 0) sets.push({reps, weight});
+  });
+  if (!sets.length) { toast('Upiši barem jednu vrijednost!'); return; }
   const today = todayKey();
   if (!state.workouts[today]) state.workouts[today] = [];
   const idx = state.workouts[today].findIndex(e => e.exId===selectedEx.id);
@@ -763,7 +795,7 @@ function renderTodayLog() {
   }
   let html = `<div style="padding:0 2px 8px;font-family:var(--font-h);font-size:11px;font-weight:700;letter-spacing:.12em;color:var(--txt3);text-transform:uppercase">Danas</div>`;
   log.forEach(e => {
-    const vol   = e.sets.reduce((a,s)=>a+s.reps*s.weight,0);
+    const vol   = calcVolume(e.exId, e.sets);
     const kcal  = calcKcal(e.exId, e.sets);
     const ex    = getEx(e.exId);
     const isC   = ex?.cardio;
@@ -777,7 +809,7 @@ function renderTodayLog() {
         ${best1RM > 0 ? `<span class="orm-badge">1RM <strong>${best1RM}</strong></span>` : ''}
       </div>
       <div style="display:flex;flex-wrap:wrap;gap:5px">
-        ${e.sets.map((s,i)=>`<span class="chip">${i+1}: ${s.reps}×${s.weight}kg</span>`).join('')}
+        ${e.sets.map((s,i)=>`<span class="chip">${formatSetChip(e.exId, s, i)}</span>`).join('')}
       </div>
       <div style="display:flex;gap:14px;margin-top:8px;font-size:11px;color:var(--txt3)">
         ${vol>0?`<span>Vol: <strong style="color:var(--acc2)">${vol.toLocaleString('hr-HR')} kg</strong></span>`:''}
@@ -834,7 +866,7 @@ function populateExSelect() {
   const usedIds = new Set();
   Object.values(state.workouts).forEach(entries => entries.forEach(e => usedIds.add(e.exId)));
   sel.innerHTML = '<option value="">— Odaberi vježbu —</option>';
-  allExercises().filter(ex => usedIds.has(ex.id)).forEach(ex => {
+  allExercises().filter(ex => usedIds.has(ex.id) && !ex.cardio).forEach(ex => {
     const o = document.createElement('option');
     o.value=ex.id; o.textContent=ex.icon+' '+ex.name;
     if (ex.id===cur) o.selected=true;
@@ -866,8 +898,8 @@ function renderVolumeChart() {
     .sort(([a],[b])=>a.localeCompare(b))
     .flatMap(([day, entries]) => {
       const entry = entries.find(e=>e.exId===exId); if (!entry) return [];
-      const vol  = entry.sets.reduce((a,s)=>a+s.reps*s.weight,0);
-      const maxW = Math.max(...entry.sets.map(s=>s.weight));
+      const vol  = calcVolume(exId, entry.sets);
+      const maxW = Math.max(...entry.sets.map(s=>cleanNum(s.weight)));
       const label = new Date(day+'T12:00:00').toLocaleDateString('hr-HR',{day:'numeric',month:'short'});
       return [{ label, vol, maxW }];
     });
@@ -933,7 +965,7 @@ function renderGlobalStats() {
   const el = document.getElementById('globalStats');
   const days = Object.keys(state.workouts).length;
   const allE = Object.values(state.workouts).flat();
-  const vol  = allE.reduce((a,e)=>a+e.sets.reduce((b,s)=>b+s.reps*s.weight,0),0);
+  const vol  = allE.reduce((a,e)=>a+calcVolume(e.exId, e.sets),0);
   const kcal = allE.reduce((a,e)=>a+calcKcal(e.exId,e.sets),0);
   el.innerHTML = `
     <div class="stat-box"><div class="sv">${days}</div><div class="sl">Treninga</div></div>
@@ -954,7 +986,7 @@ function renderPovijest() {
     return `<div class="session-card">
       <div class="session-date">${formatDate(key)}</div>
       ${entries.map(e=>{
-        const vol=e.sets.reduce((a,s)=>a+s.reps*s.weight,0);
+        const vol=calcVolume(e.exId, e.sets);
         return `<div class="session-ex" style="margin-bottom:4px">
           <span style="font-size:17px">${e.icon}</span>
           <span class="session-ex-name" style="font-size:14px">${e.exName}</span>
@@ -962,7 +994,7 @@ function renderPovijest() {
           ${vol>0?`<span style="font-size:11px;color:var(--acc2)">${vol.toLocaleString('hr-HR')} kg</span>`:''}
         </div>
         <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px">
-          ${e.sets.map((s,i)=>`<span class="chip">${i+1}: ${s.reps}×${s.weight}kg</span>`).join('')}
+          ${e.sets.map((s,i)=>`<span class="chip">${formatSetChip(e.exId, s, i)}</span>`).join('')}
         </div>`;
       }).join('')}
       <div style="display:flex;align-items:center;justify-content:space-between;margin-top:4px">
@@ -1308,15 +1340,17 @@ function calcPRs() {
   const prs = {}; // exId → { maxWeight, maxVol, totalSets, totalReps, lastDate, max1RM }
   Object.entries(state.workouts).sort(([a],[b])=>a.localeCompare(b)).forEach(([day, entries]) => {
     entries.forEach(e => {
+      const ex = getEx(e.exId);
+      if (ex?.cardio) return;
       if (!prs[e.exId]) prs[e.exId] = { name:e.exName, icon:e.icon, maxW:0, maxVol:0, totalSets:0, totalReps:0, lastDate:day, max1RM:0 };
-      const vol  = e.sets.reduce((a,s)=>a+s.reps*s.weight, 0);
-      const maxW = Math.max(...e.sets.map(s=>s.weight));
-      const max1RM = Math.max(...e.sets.map(s=>calc1RM(s.weight, s.reps)));
+      const vol  = calcVolume(e.exId, e.sets);
+      const maxW = Math.max(...e.sets.map(s=>cleanNum(s.weight)));
+      const max1RM = Math.max(...e.sets.map(s=>calc1RM(cleanNum(s.weight), cleanNum(s.reps))));
       prs[e.exId].maxW       = Math.max(prs[e.exId].maxW, maxW);
       prs[e.exId].maxVol     = Math.max(prs[e.exId].maxVol, vol);
       prs[e.exId].max1RM     = Math.max(prs[e.exId].max1RM, max1RM);
       prs[e.exId].totalSets += e.sets.length;
-      prs[e.exId].totalReps += e.sets.reduce((a,s)=>a+(parseFloat(s.reps)||0),0);
+      prs[e.exId].totalReps += e.sets.reduce((a,s)=>a+cleanNum(s.reps),0);
       prs[e.exId].lastDate   = day;
     });
   });
